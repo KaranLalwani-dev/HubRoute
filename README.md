@@ -80,11 +80,10 @@ Use Python 3.10+ from the repository root:
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-python -m pip install scipy
 python -m uvicorn backend.app:app --port 8000
 ```
 
-Open [http://127.0.0.1:8000](http://127.0.0.1:8000). The extra SciPy install is required by the solver's sparse shortest-path implementation; it is not currently listed in `requirements.txt`.
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000). SciPy is required for the solver's sparse shortest-path implementation and is included in `requirements.txt`.
 
 The solver also needs the dataset's `resplan_utils.py` module (the helper imported by the original notebook). Put it in `backend/` or make it available on `PYTHONPATH`. To browse the original dataset, put `ResPlan.pkl` in `backend/data/` or set `RESPLAN_PKL` to its path. If present, `split.json` is read beside the pickle. The dataset and helper are **not included** in this repository. Python pickle files should be loaded only from a source you trust.
 

@@ -1,62 +1,144 @@
-# Cable Ring Planner (Honeywell PS4, UR Hackathon 2026H2)
+# HubRoute
 
-Local web app around our solver: pick a ResPlan plan, solve it (minimum number of hubs, then the cheapest cable rings), see the annotated picture,
-download the JSON in the slide-8 format (plus SVG and PNG of the picture).
+**A floor-plan cable-ring planner:** assign one device to each eligible room, use the fewest feasible hubs, and route a closed, wall-avoiding cable loop through the devices served by each hub.
 
-Status: built and tested against **synthetic mock plans only** (the sandbox it was written in has no ResPlan data). First thing to do on your machine: run the smoke test on real plans.
+HubRoute began as a solver for the Honeywell PS4 problem in UR Hackathon 2026H2. It also includes a local plan browser: load a ResPlan floor plan, inspect its geometry, solve it, review the validator's findings, and export the design as JSON or a diagram.
 
-## Layout
+The central distinction is deliberate: **hub count is solved exactly within the supported plan size and the selected connectivity rule; cable placement is a bounded search, not a proof of globally minimum cable cost.** Every returned solution must pass a separate geometric validator.
+
+## At a glance
+
+| Input | Output |
+| --- | --- |
+| ResPlan room, wall, window, door, and floor-boundary geometry | A territory for each hub; one device per eligible room; a closed, axis-aligned cable path per hub |
+| Room adjacency and area | The minimum feasible hub count under the selected link rule, plus validation and cost metrics |
+| Optional plan ID, dataset split, and solve budget | An annotated diagram and a JSON design that is read back and checked before use |
+
+Eligible rooms are living rooms, bedrooms, kitchens, and storage rooms. Bathrooms can be part of the cable's traversable interior but receive no device; stairs are excluded. A hub serves at most five devices and 100 m² of assigned room area. These are the rules encoded in this repository, including its explicit interpretation of room connectivity.
+
+## How a plan becomes a design
+
+```mermaid
+flowchart TD
+    A["ResPlan geometry"] --> B["Prepare rooms and routing space"]
+    B --> C["Exact minimum-hub DP"]
+    C --> D["Enumerate feasible territories"]
+    D --> E["Route and improve cable rings"]
+    E --> F["Independent validation"]
+    F --> G["Diagram and checked JSON"]
 ```
-cells/      the solver, exactly the notebook cells (V1 validator, P1 prepare, S1 ring solver, S11 multi-hub, S18 picture helpers, S19 JSON export, S20 batch runner)
-backend/    core.py (loads the cells into one namespace), scene.py (geometry for the page), app.py (FastAPI)
-frontend/   index.html, style.css, app.js (plain JavaScript, SVG drawing, no build step)
-tests/      test_codec.py (plan file round trip, no data needed), test_smoke.py (needs real plans)
-tools/      export_plans.py (ResPlan.pkl to plan files)
+
+### 1. Normalize geometry and define what is possible
+
+[`prepare`](cells/cellP1_prepare.py) converts drawing coordinates to metres, repairs invalid polygons, extracts eligible rooms, and constructs a routing space from interior rooms and doors after subtracting walls and windows. It adds a small wall clearance. The plan's `inner` boundary is applied only when it actually aligns with the eligible rooms; malformed or augmented geometry is surfaced as a flag instead of silently forcing a bad cut.
+
+Room connectivity has two modes. `helper` follows the dataset helper's door/opening graph after additional door checks. The default `physical` mode also requires an open geometric passage between adjacent rooms. A proposed territory must be connected under the chosen mode, stay within one routing-space component, and satisfy the device and area limits. This connectivity choice can change the minimum number of hubs, so it is visible in the app and the result.
+
+### 2. Minimize hubs exactly
+
+For up to **14 eligible rooms**, the preparation step records which subsets of rooms can be served by one hub. A bitmask dynamic program then covers all rooms with the fewest valid subsets:
+
+`best[mask] = min(1 + best[mask without territory])` over feasible territories containing a fixed room in `mask`.
+
+This establishes the minimum hub count under the repository's constraints. It does **not** optimize cable length globally. For larger plans the exact-count path stops and reports a failure rather than presenting an unproved hub count.
+
+### 3. Search for cable rings
+
+[`cellS1_ring_solver.py`](cells/cellS1_ring_solver.py) builds a rectilinear grid inside the allowed routing space. Grid lines follow geometric boundaries and candidate room positions; additional parallel lanes in doors give the search different ways through a narrow opening. Edges are checked against the entire allowed region, not just their endpoints.
+
+Shortest paths run on `(grid vertex, arrival heading)` states. A transition costs its length plus a turn penalty, so a route with the same distance but fewer bends is preferred. For each room, the solver samples candidate device positions near doors, near the room centre, and across the usable floor. It examines cyclic device orders and uses a min-plus dynamic program over candidate positions and headings to choose a closed loop. The best orders are reconstructed, scored using the validator's geometric metrics, and improved by rerouting individual legs with overlap and crossing penalties. A hub is placed on the completed ring when possible, with a short detour fallback.
+
+For multiple hubs, [`cellS11_multi_hub.py`](cells/cellS11_multi_hub.py) enumerates minimum-hub room partitions, ranks them with cheaper territory solves, fully routes a shortlist, and then reroutes one ring while treating the others as fixed obstacles to the score. Its partition cap, shortlist, grid limit, and soft time budget keep the search bounded. This is why the returned cable layout is a *good feasible candidate*, not a global optimum.
+
+### 4. Check the actual design
+
+[`cellV1_validator.py`](cells/cellV1_validator.py) receives the plan context and finished path, then independently checks coverage, one device per eligible room, territory connectivity, hub capacity, room and device placement, closed loops, device visit order, axis-aligned segments, and whether every cable segment stays inside the allowed floor. It also checks the expected hub count. A search result is marked successful only when this validator accepts it.
+
+The metric used to compare layouts is
+
+`J = cable length + 5 × crossings + overlap length + 0.5 × bends`.
+
+Length and overlap are measured in metres. The validator reports both strict crossings and a more conservative count that includes cable touches; the multi-hub search penalizes those extra touches too. These are **cost weights used by this implementation**, not physical installation prices.
+
+[`cellS19_json_export.py`](cells/cellS19_json_export.py) writes hub locations, assigned rooms and nodes, ordered cable segments, lengths, and metrics. Its `check_json` reconstructs a solution **from the serialized file**, validates it again, and compares the stated lengths and objective to the reconstructed geometry. This catches an export that disagrees with the in-memory design.
+
+## Why the algorithm is split this way
+
+| Decision | Reason | Limit |
+| --- | --- | --- |
+| Exact subset DP for hubs | Hub count is a discrete, high-priority constraint and can be proved for small room sets. | Bounded to 14 eligible rooms. |
+| Geometry-based `physical` links | A graph edge alone does not prove a cable can pass between rooms. | The result depends on the chosen connectivity interpretation and clearance. |
+| Heading-aware shortest paths | Cable bends matter even when distance is unchanged. | The search is limited to its constructed grid and sampled device positions. |
+| Joint rerouting across hubs | Independently good rings can overlap or cross each other. | Only a bounded number of partitions and improvement rounds are explored. |
+| Separate validation and JSON round trip | Search scores and exported paths can be wrong independently. | Validation establishes feasibility under encoded rules, not global optimality. |
+
+## Run the local app
+
+Use Python 3.10+ from the repository root:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m pip install scipy
+python -m uvicorn backend.app:app --port 8000
 ```
-The algorithm lives only in `cells/`; the notebook and the app run the same files.
 
-## Run
-1. Python 3.10+. `python -m venv .venv`, activate it, `pip install -r requirements.txt`.
-2. Put `ResPlan.pkl` and `split.json` into `backend/data/` (or set `RESPLAN_PKL=/path/to/ResPlan.pkl`; `split.json` is read from the same folder).
-   If the pickle does not load, install the same shapely / networkx versions as in the Kaggle notebook.
-3. Put the dataset helper `resplan_utils.py` (the file imported in Kaggle Cell 25) into `backend/`.
-4. From the repository root: `python -m uvicorn backend.app:app --port 8000`, then open http://127.0.0.1:8000
-   (`?plan=14433` in the address opens a plan directly).
-5. Optional check: `python -m pytest -q`.
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000). The extra SciPy install is required by the solver's sparse shortest-path implementation; it is not currently listed in `requirements.txt`.
 
-### Plans in and out
-- The page has a plan browser (3 plans per page by default; 3, 6, 12 or 24 per page, page number box, find by id). Each plan shows a small picture and, once solved, its J and hub count.
-- **Upload plan list**: one JSON file that holds many plans (a list, or `{"plans": [...]}`). **Upload single plan**: one plan as a JSON file (several files at once also work). You can also drop files onto the picture area.
-  Uploaded plans appear under the split "uploaded"; a plan with the same id as a dataset plan replaces it.
-- The file layout is the dataset's own plan dict: the same keys (`id`, `area`, `net_area`, `wall_depth`, ..., one geometry per layer) with the geometries as WKT text; see `backend/plan_codec.py`.
-  Make such files from the pickle with `tools/export_plans.py`:
-  ```
-  python tools/export_plans.py --pkl backend/data/ResPlan.pkl --ids 14433 2373 --out samples --verify      (one file per plan)
-  python tools/export_plans.py --pkl backend/data/ResPlan.pkl --split val --limit 30 --out samples --bundle   (one file with all of them)
-  ```
-  `--verify` reads every file back and checks that the geometry is identical. The stored NetworkX graph is not written; the solver builds its own from the layers.
-- Without `ResPlan.pkl` the app still starts: use the upload buttons.
+The solver also needs the dataset's `resplan_utils.py` module (the helper imported by the original notebook). Put it in `backend/` or make it available on `PYTHONPATH`. To browse the original dataset, put `ResPlan.pkl` in `backend/data/` or set `RESPLAN_PKL` to its path. If present, `split.json` is read beside the pickle. The dataset and helper are **not included** in this repository. Python pickle files should be loaded only from a source you trust.
 
-Solved plans are cached in `backend/cache/` (shift-click Solve to solve again). Delete that folder after changing anything in `cells/`.
+The app starts without `ResPlan.pkl`; you can upload a plan JSON instead. Uploading and solving still require the helper module. The browser supports plan IDs, dataset splits, uploaded plans, solved-design inspection, and JSON download. A solved plan is cached under `backend/cache/`; use the UI's force solve action or clear the cache after changing the solver.
 
-## Where to change what (after the organizers answer)
-| Question | Where |
-|---|---|
-| 1 which rooms are connected | `cells/cellP1_prepare.py` (`prepare`, link sets "helper" and "physical"; the page has a Link rule switch) |
-| 2, 8 touching walls, clearance, tolerance | `cells/cellV1_validator.py` (`CFG["tol"]`), `cells/cellP1_prepare.py` (`P_CFG["margin_m"]`), `cells/cellS1_ring_solver.py` (`S_CFG["inset_m"]`; multi-hub: `S11_CFG["inset_m"]` in S11) |
-| 3 sliver rooms | `cells/cellP1_prepare.py` (`min_area_m2`, placement tiers) |
-| 4, 5 nested rooms, rooms in pieces | `cells/cellP1_prepare.py` (overlap rule, piece handling) |
-| 6 hub and device distance | `cells/cellS1_ring_solver.py` (`S_CFG["gap_m"]`, `hub_min_m`) |
-| 7 crossings at another ring's node | `cells/cellV1_validator.py` (`v_crossings`), `S_CFG["conservative"]` |
-| 9 rooms over 100 m2 | `cells/cellS18_design_picture.py` (`solve_plan`): such plans are not solved yet |
-| 10 augmented plans, scale | `cells/cellP1_prepare.py` (`aligned_share`, scale formula in `prepare`) |
-| 11 how the hidden plans are run | `cells/cellS20_batch_runner.py` (notebook batch run) or this app |
-| 12 JSON details | `cells/cellS19_json_export.py` (`plan_to_json`) |
+To convert available dataset plans into portable upload files:
 
-## API
-- `GET /api/status`, `GET /api/plans?split=&q=&limit=&offset=` (one page; adds J and hub count for solved plans), `GET /api/random?split=`
-- `POST /api/upload` body: one plan file, a list of them, or `{"plans": [...]}` (dataset layout as JSON)
-- `GET /api/plans/{id}` geometry (and the cached solution if there is one)
-- `POST /api/plans/{id}/solve` body `{"seconds": 30, "link_set": "physical", "force": false}`
-- `GET /api/plans/{id}/result.json` the slide-8 JSON of a solved plan
+```bash
+python tools/export_plans.py --pkl backend/data/ResPlan.pkl --ids 14433 2373 --out samples --verify
+python tools/export_plans.py --pkl backend/data/ResPlan.pkl --split val --limit 30 --out samples --bundle
+```
+
+The upload format stores the original plan's geometric layers as WKT. [`backend/plan_codec.py`](backend/plan_codec.py) defines the conversion and checks required fields. The generated design JSON is a separate output format; it describes hubs, nodes, ordered cable segments, and metrics rather than the input floor plan.
+
+## API and data flow
+
+The frontend is plain JavaScript and SVG; no build step is needed. [`backend/app.py`](backend/app.py) exposes these routes:
+
+| Route | Purpose |
+| --- | --- |
+| `GET /api/status` | Solver and dataset readiness. |
+| `GET /api/plans`, `GET /api/random` | Browse or select a plan. |
+| `POST /api/upload` | Import one plan, a list, or `{ "plans": [...] }`. |
+| `GET /api/plans/{id}` | Return plan geometry and any cached result. |
+| `POST /api/plans/{id}/solve` | Solve with `seconds`, `link_set`, and optional `force`. |
+| `GET /api/plans/{id}/result.json` | Download a solved design. |
+
+[`backend/core.py`](backend/core.py) executes the notebook-derived solver cells in dependency order into one shared namespace. The local API serializes CPU-bound solves with a lock. [`backend/scene.py`](backend/scene.py) turns plan and result geometry into browser data; [`cellS18_design_picture.py`](cells/cellS18_design_picture.py) also produces annotated static diagrams. The batch runner in [`cellS20_batch_runner.py`](cells/cellS20_batch_runner.py) belongs to the notebook workflow: it uses Linux `fork`, writes a summary CSV and one JSON file per plan, and can resume completed files. It is not an API endpoint.
+
+## Verification and known limits
+
+Run `python -m pytest -q` for the repository tests. [`tests/test_codec.py`](tests/test_codec.py) checks the input plan JSON round trip with synthetic geometry and rejects incomplete files. [`tests/test_smoke.py`](tests/test_smoke.py) needs the real dataset and helper. The public repository does not include that data, a full batch result, or a reproducible performance benchmark; run the smoke test and batch runner with your dataset before citing success rates or timing on real plans.
+
+| Situation | What happens |
+| --- | --- |
+| No eligible rooms, more than 14 eligible rooms, or no feasible room cover | The plan is reported unsolved. |
+| A single room exceeds 100 m² | It is flagged; the solver cannot claim a valid capacity-constrained design. |
+| Room has no usable grid candidate, geometry disconnects the route, or grid exceeds 20,000 vertices | The route search returns an explicit failure. |
+| Multi-hub search reaches its partition or time budget | It considers only the explored candidates; success still requires validation. |
+| Device cannot fit at the default inset | The solver retries with no inset and records the retry. |
+| Exported JSON does not reproduce the checked route or metrics | The file check reports the mismatch. |
+
+The geometry rules, tolerances, and connectivity assumptions are implementation choices in the linked source. If an external evaluator uses different interpretations of doors, clearances, or special room geometries, its verdict may differ from this validator's. The solver does not silently convert a failed route into a successful one.
+
+## Source map
+
+| Area | Entry point |
+| --- | --- |
+| Room preparation and exact hub-count DP | [`cells/cellP1_prepare.py`](cells/cellP1_prepare.py) — `prepare`, `p_table`, `p_min_hubs` |
+| Single-territory routing and local improvements | [`cells/cellS1_ring_solver.py`](cells/cellS1_ring_solver.py) — `solve_territory`, `solve_h1` |
+| Minimum-hub partition search and joint routing | [`cells/cellS11_multi_hub.py`](cells/cellS11_multi_hub.py) — `s11_solve`, `solve_multi` |
+| Constraint checks and objective | [`cells/cellV1_validator.py`](cells/cellV1_validator.py) — `validate`, `v_metrics` |
+| Solve orchestration and diagram | [`cells/cellS18_design_picture.py`](cells/cellS18_design_picture.py) — `solve_plan`, `draw_design` |
+| Output and round-trip verification | [`cells/cellS19_json_export.py`](cells/cellS19_json_export.py) — `plan_to_json`, `check_json` |
+| Batch execution | [`cells/cellS20_batch_runner.py`](cells/cellS20_batch_runner.py) — `run_batch` |
+| Local app and input format | [`backend/app.py`](backend/app.py), [`backend/plan_codec.py`](backend/plan_codec.py), [`frontend/`](frontend/) |
 

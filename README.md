@@ -34,6 +34,8 @@ flowchart TD
 
 Room connectivity has two modes. `helper` follows the dataset helper's door/opening graph after additional door checks. The default `physical` mode also requires an open geometric passage between adjacent rooms. A proposed territory must be connected under the chosen mode, stay within one routing-space component, and satisfy the device and area limits. This connectivity choice can change the minimum number of hubs, so it is visible in the app and the result.
 
+One less obvious failure came from unit conversion: a polygon valid in drawing coordinates can become invalid after scaling when nearly touching edges collapse together. The preparation code repairs geometry both before and after scaling and prefers Shapely's structure-based repair to preserve wall shells and holes. Filling a wall hole by accident would change which paths appear traversable, so this is part of routing correctness rather than a display cleanup.
+
 ### 2. Minimize hubs exactly
 
 For up to **14 eligible rooms**, the preparation step records which subsets of rooms can be served by one hub. A bitmask dynamic program then covers all rooms with the fewest valid subsets:

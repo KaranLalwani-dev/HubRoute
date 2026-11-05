@@ -60,6 +60,3 @@ Solved plans are cached in `backend/cache/` (shift-click Solve to solve again). 
 - `POST /api/plans/{id}/solve` body `{"seconds": 30, "link_set": "physical", "force": false}`
 - `GET /api/plans/{id}/result.json` the slide-8 JSON of a solved plan
 
-## Not done yet
-- The organizers' own input file format is not known (slide 8 shows only the output). We use the dataset's plan layout as JSON; if their input files differ, only `backend/plan_codec.py` needs a change.
-- Oversize plans (a room over 100 m2), sliver-room fallback, the batch run over all plans.
